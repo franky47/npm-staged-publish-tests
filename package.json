@@ -1,0 +1,16 @@
+{
+  "name": "@47ng/staged-publishing-test",
+  "version": "0.0.0",
+  "description": "Used for testing purposes only.",
+  "private": false,
+  "files": [
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/franky47/npm-staged-publish-tests.git"
+  }
+}

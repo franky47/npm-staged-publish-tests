@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+*.sigstore
+stage-output.json
+restage-output.json
+restage-error.txt
+attest.json

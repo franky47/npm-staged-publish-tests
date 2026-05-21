@@ -1,0 +1,242 @@
+# Experiment: staged publishing × trusted publishing × provenance
+#
+# GOAL — confirm server-side behaviours not observable from npm CLI source:
+#   B. After `npm stage approve`, does the published packument carry provenance
+#      (`dist.attestations`)?  -> tests willow.sh's "provenance is lost" report.
+#   C. After `npm stage reject`, can the SAME version be re-staged WITH provenance,
+#      or is it burned by a pre-existing attestation record?  -> tests dominikg.dev.
+#   D. Same re-stage WITHOUT provenance -> isolates provenance as the cause.
+#   E. Control: stage/reject/re-stage with no provenance anywhere.
+#
+# WHERE THIS GOES — the repo of the throwaway test package
+# (e.g. @47ng/staged-publishing-test), NOT semantic-release/npm.
+# Drop it in that repo's .github/workflows/.
+#
+# PREREQUISITES (one-time, on npmjs.com):
+#   - The test package already exists and is PUBLIC (provenance requires public).
+#   - A trusted-publishing relationship is configured for this repo+workflow,
+#     with `npm stage publish` allowed (--allow-stage-publish). No NPM_TOKEN needed.
+#   - 2FA enabled on the account doing approve/reject.
+#
+# HOW TO RUN — staged publishing needs a human 2FA gate, so the experiment is
+# several dispatches with manual approve/reject in between (CLI or npmjs.com):
+#
+#   Test B (provenance survives approve?):
+#     1. Run step=stage-prov            -> note the printed VERSION + STAGE ID
+#     2. Manually `npm stage approve <id>`
+#     3. Run step=inspect  version=<VERSION>
+#
+#   Test C/D (version burned by reject?):
+#     4. Run step=stage-prov            -> note VERSION + STAGE ID
+#     5. Manually `npm stage reject <id>`
+#     6. Run step=restage  version=<VERSION>  provenance=true   (expect: ???)
+#     7. Run step=restage  version=<VERSION>  provenance=false  (expect: ???)
+#
+#   Test E (control, no provenance):
+#     8. Run step=stage-noprov          -> note VERSION + STAGE ID
+#     9. Manually `npm stage reject <id>`
+#    10. Run step=restage  version=<VERSION>  provenance=false  (expect: success)
+#
+#   Test F: look the rejected versions up on https://search.sigstore.dev/ —
+#   the Rekor entry is immutable and will persist regardless of reject.
+
+name: staged-publishing-provenance-experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "Experiment step to run"
+        required: true
+        type: choice
+        options:
+          - stage-prov # stage a fresh version WITH provenance
+          - stage-noprov # stage a fresh version WITHOUT provenance
+          - restage # re-stage an existing version (after a manual reject)
+          - inspect # inspect a published version for provenance/attestations
+      version:
+        description: "Version to re-stage or inspect (required for restage/inspect; ignored otherwise)"
+        required: false
+        type: string
+      provenance:
+        description: "For step=restage: re-stage with --provenance?"
+        required: false
+        default: true
+        type: boolean
+
+# id-token: write powers BOTH the trusted-publishing token exchange and the
+# Fulcio/Sigstore signing for provenance.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PKG: "@47ng/staged-publishing-test"
+  PKG_ENC: "@47ng%2Fstaged-publishing-test" # URL-encoded for direct registry GETs
+  DIST_TAG: experiments # explicit tag: 0.0.0-* prereleases require --tag
+  REGISTRY: "https://registry.npmjs.org/"
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Pin npm >= 11.15.0 (staged publishing GA)
+        run: |
+          npm install -g npm@^11.15.0
+          echo "npm version: $(npm --version)"
+
+      - name: Resolve target version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.step }}" = "restage" ] || [ "${{ inputs.step }}" = "inspect" ]; then
+            if [ -z "${{ inputs.version }}" ]; then
+              echo "::error::step=${{ inputs.step }} requires a 'version' input"
+              exit 1
+            fi
+            VERSION="${{ inputs.version }}"
+          else
+            # Fresh, collision-proof prerelease version for a new stage.
+            VERSION="0.0.0-exp.${{ github.run_id }}.${{ github.run_attempt }}"
+          fi
+          echo "version=$VERSION" | tee -a "$GITHUB_OUTPUT"
+          echo "## Experiment: ${{ inputs.step }} — \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write version into package.json
+        if: inputs.step != 'inspect'
+        run: |
+          set -euo pipefail
+          npm version "${{ steps.ver.outputs.version }}" \
+            --no-git-tag-version --allow-same-version
+          echo "package.json version: $(node -p "require('./package.json').version")"
+
+      # --- STAGE (fresh version) -------------------------------------------
+      - name: Stage WITH provenance
+        if: inputs.step == 'stage-prov'
+        run: |
+          set -euo pipefail
+          npm stage publish . \
+            --tag "${{ env.DIST_TAG }}" \
+            --provenance \
+            --json | tee stage-output.json
+          STAGE_ID="$(node -p "Object.values(require('./stage-output.json'))[0].stageId")"
+          {
+            echo "### Staged WITH provenance"
+            echo "- version: \`${{ steps.ver.outputs.version }}\`"
+            echo "- stage id: \`$STAGE_ID\`"
+            echo ""
+            echo "Next: \`npm stage approve $STAGE_ID\` (test B) or"
+            echo "\`npm stage reject $STAGE_ID\` (test C/D), then re-run accordingly."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- STAGE (fresh version, no provenance) ----------------------------
+      - name: Stage WITHOUT provenance
+        if: inputs.step == 'stage-noprov'
+        run: |
+          set -euo pipefail
+          npm stage publish . \
+            --tag "${{ env.DIST_TAG }}" \
+            --json | tee stage-output.json
+          STAGE_ID="$(node -p "Object.values(require('./stage-output.json'))[0].stageId")"
+          {
+            echo "### Staged WITHOUT provenance (control)"
+            echo "- version: \`${{ steps.ver.outputs.version }}\`"
+            echo "- stage id: \`$STAGE_ID\`"
+            echo ""
+            echo "Next: \`npm stage reject $STAGE_ID\`, then step=restage provenance=false."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- RE-STAGE an existing (rejected) version -------------------------
+      # Expected to FAIL if dominikg.dev is right and provenance=true.
+      # `continue-on-error` so we can record the outcome either way.
+      - name: Re-stage existing version
+        if: inputs.step == 'restage'
+        id: restage
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          PROV_FLAG=""
+          if [ "${{ inputs.provenance }}" = "true" ]; then PROV_FLAG="--provenance"; fi
+          echo "Re-staging ${{ steps.ver.outputs.version }} ${PROV_FLAG:-(no provenance)}"
+          set +e
+          npm stage publish . \
+            --tag "${{ env.DIST_TAG }}" \
+            $PROV_FLAG \
+            --json > restage-output.json 2> restage-error.txt
+          echo "exit_code=$?" | tee -a "$GITHUB_OUTPUT"
+          set -e
+          echo "--- stdout ---"; cat restage-output.json || true
+          echo "--- stderr ---"; cat restage-error.txt || true
+
+      - name: Report re-stage outcome
+        if: inputs.step == 'restage'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Re-stage outcome"
+            echo "- version: \`${{ steps.ver.outputs.version }}\`"
+            echo "- provenance: \`${{ inputs.provenance }}\`"
+            echo "- exit code: \`${{ steps.restage.outputs.exit_code }}\`"
+            echo ""
+            echo '```'
+            cat restage-error.txt 2>/dev/null || echo "(no stderr)"
+            echo '```'
+            if [ "${{ steps.restage.outputs.exit_code }}" = "0" ]; then
+              echo "✅ Re-stage SUCCEEDED — version not burned."
+            else
+              echo "❌ Re-stage FAILED — version appears burned. Capture the error code above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- INSPECT a published version for provenance ----------------------
+      - name: Inspect published version for provenance
+        if: inputs.step == 'inspect'
+        run: |
+          set -uo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          echo "## Inspecting ${PKG}@${V} for provenance" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=== 1. Direct registry GET of the version manifest ==="
+          MANIFEST="$(curl -fsSL "${REGISTRY}${PKG_ENC}/${V}" || echo '{}')"
+          echo "$MANIFEST" | node -e '
+            let m={}; try{m=JSON.parse(require("fs").readFileSync(0,"utf8"))}catch{}
+            console.log("dist keys:", Object.keys(m.dist||{}));
+            console.log("dist.attestations:", JSON.stringify(m.dist?.attestations ?? null));
+          '
+
+          echo "=== 2. Attestations endpoint ==="
+          # 200 + bundle => provenance present; 404 => absent.
+          curl -s -o attest.json -w "HTTP %{http_code}\n" \
+            "${REGISTRY}-/npm/v1/attestations/${PKG}@${V}" || true
+          head -c 600 attest.json 2>/dev/null || true; echo
+
+          echo "=== 3. npm view dist.attestations ==="
+          npm view "${PKG}@${V}" --json | node -e '
+            let m={}; try{m=JSON.parse(require("fs").readFileSync(0,"utf8"))}catch{}
+            console.log(JSON.stringify(m.dist?.attestations ?? null, null, 2));
+          ' || true
+
+          echo "=== 4. npm audit signatures ==="
+          mkdir -p /tmp/auditcheck && cd /tmp/auditcheck
+          npm init -y >/dev/null 2>&1
+          npm install "${PKG}@${V}" --no-save --ignore-scripts >/dev/null 2>&1 || true
+          npm audit signatures || true
+          cd - >/dev/null
+
+          {
+            echo ""
+            echo "### Verdict"
+            echo "If steps 1–4 show **no attestations** but the version was staged"
+            echo "with \`--provenance\`, willow.sh's report is confirmed: the Rekor"
+            echo "entry exists (check https://search.sigstore.dev/) but the registry"
+            echo "dropped the provenance during \`npm stage approve\`."
+          } >> "$GITHUB_STEP_SUMMARY"
