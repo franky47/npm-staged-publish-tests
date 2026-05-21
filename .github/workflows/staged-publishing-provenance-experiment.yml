@@ -89,10 +89,16 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Pin npm >= 11.15.0 (staged publishing GA)
+      - name: Pin npm to a staged-publishing-capable version
         run: |
-          npm install -g npm@^11.15.0
-          echo "npm version: $(npm --version)"
+          set -euo pipefail
+          # Install the new npm with the OLD npm into a separate prefix, so npm
+          # never rewrites its own running node_modules. The in-place
+          # `npm install -g npm` self-upgrade races and intermittently dies with
+          # MODULE_NOT_FOUND (Cannot find module 'promise-retry').
+          npm install npm@11.15.0 --prefix "$RUNNER_TEMP/npm-pinned" --no-fund --no-audit
+          echo "$RUNNER_TEMP/npm-pinned/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "npm version: $("$RUNNER_TEMP/npm-pinned/node_modules/.bin/npm" --version)"
 
       - name: Resolve target version
         id: ver
